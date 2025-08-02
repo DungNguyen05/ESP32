@@ -1,3 +1,5 @@
+import '../services/api_service.dart';
+
 class ESP32Device {
   final String name;
   final String serialNumber;
@@ -22,17 +24,25 @@ class ESP32Device {
       name: name,
       serialNumber: sn,
       deviceId: deviceId,
-      isRegistered: _checkDeviceRegistration(sn), // TODO: Implement server check
+      isRegistered: true, // Sẽ được validate async sau này
       rssi: rssi,
     );
   }
   
   // Kiểm tra device có được đăng ký trong hệ thống không
-  static bool _checkDeviceRegistration(String serialNumber) {
-    // TODO: Implement actual registration check with server/database
-    // For now, return true for all devices
-    // In production, this should check against your backend API
-    return true;
+  static Future<bool> checkDeviceRegistration(String serialNumber) async {
+    try {
+      // Gọi API thực tế để kiểm tra registration
+      return await ApiService.checkDeviceRegistration(serialNumber);
+    } catch (e) {
+      print('Error checking device registration: $e');
+      return false; // Không cho phép nếu không kiểm tra được
+    }
+  }
+  
+  // Validate device async
+  Future<bool> validateRegistration() async {
+    return await checkDeviceRegistration(serialNumber);
   }
   
   @override

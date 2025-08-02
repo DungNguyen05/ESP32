@@ -6,7 +6,7 @@ import 'dart:convert';
 class ESP32Handler {
   BluetoothDevice? _connectedDevice;
   BluetoothCharacteristic? _wifiListChar; // CE01 - Read WiFi list
-  BluetoothCharacteristic? _wifiConfigChar; // CF02 - Write WiFi config & receive notifications
+  BluetoothCharacteristic? _wifiConfigChar; // CE02 - Write WiFi config & receive notifications
   
   StreamSubscription? _connectionSubscription;
   StreamSubscription? _notificationSubscription;
@@ -57,63 +57,65 @@ class ESP32Handler {
         }
       }
       
-      // Check BOTH services 12CE and 12CF
-      List<BluetoothService> targetServices = [];
+      // Find services 12CE and 12CF
+      BluetoothService? serviceForRead;
+      BluetoothService? serviceForWrite;
+      
       for (BluetoothService service in services) {
         String serviceUuid = service.uuid.toString().toUpperCase();
         if (kDebugMode) {
           print('Checking service: $serviceUuid');
         }
         
-        if (serviceUuid.contains('12CE') || serviceUuid.contains('12CF')) {
-          targetServices.add(service);
+        if (serviceUuid.contains('12CE')) {
+          serviceForRead = service;
           if (kDebugMode) {
-            print('Found target service: $serviceUuid');
+            print('Found service 12CE for reading WiFi list');
+          }
+        } else if (serviceUuid.contains('12CF')) {
+          serviceForWrite = service;
+          if (kDebugMode) {
+            print('Found service 12CF for WiFi configuration');
           }
         }
       }
       
-      if (targetServices.isEmpty) {
+      if (serviceForRead == null && serviceForWrite == null) {
         if (kDebugMode) {
-          print('No target services found');
+          print('No target services 12CE or 12CF found');
         }
         await disconnect();
         return false;
       }
       
-      
-      // List all available characteristics from ALL target services
-      if (kDebugMode) {
-        print('Scanning characteristics in all target services:');
-        for (BluetoothService service in targetServices) {
-          print('Service ${service.uuid}:');
-          for (BluetoothCharacteristic char in service.characteristics) {
-            print('  - UUID: ${char.uuid}');
-            print('    Properties: Read=${char.properties.read}, Write=${char.properties.write}, Notify=${char.properties.notify}');
+      // Find characteristics CE01 in service 12CE (for reading WiFi list)
+      if (serviceForRead != null) {
+        for (BluetoothCharacteristic char in serviceForRead.characteristics) {
+          String charUuid = char.uuid.toString().toUpperCase();
+          
+          if (charUuid.contains('CE01') && char.properties.read) {
+            _wifiListChar = char;
+            if (kDebugMode) {
+              print('Found CE01 (WiFi list) characteristic: $charUuid');
+            }
+            break;
           }
         }
       }
       
-      // Find characteristics CE01 and CF02 in ALL target services
-      for (BluetoothService service in targetServices) {
-        String serviceUuid = service.uuid.toString().toUpperCase();
-        
-        for (BluetoothCharacteristic char in service.characteristics) {
+      // Find characteristics CE02 in service 12CF (for writing WiFi config and notifications)
+      if (serviceForWrite != null) {
+        for (BluetoothCharacteristic char in serviceForWrite.characteristics) {
           String charUuid = char.uuid.toString().toUpperCase();
           
-          if (charUuid.contains('CE01')) {
-            // WiFi list characteristic (read WiFi networks) - in 12CE service
-            _wifiListChar = char;
-            if (kDebugMode) {
-              print('Found CE01 (WiFi list) in service $serviceUuid: $charUuid');
-            }
-          } else if (charUuid.contains('CE02')) {
-            // CE02 for notifications only (no write capability)
+          if (charUuid.contains('CE02')) {
+            _wifiConfigChar = char;
+            
+            // Enable notifications on CE02
             if (char.properties.notify || char.properties.indicate) {
               try {
                 await char.setNotifyValue(true);
                 
-                // Listen for notifications on CE02
                 _notificationSubscription = char.onValueReceived.listen(
                   (value) {
                     String message = String.fromCharCodes(value);
@@ -130,7 +132,7 @@ class ESP32Handler {
                 );
                 
                 if (kDebugMode) {
-                  print('Found CE02 (notification channel) in service $serviceUuid and enabled notifications: $charUuid');
+                  print('Found CE02 (WiFi config + notification) characteristic: $charUuid');
                 }
               } catch (e) {
                 if (kDebugMode) {
@@ -138,69 +140,9 @@ class ESP32Handler {
                 }
               }
             }
-          }
-          // Use CF02 for WiFi configuration writing (has write capability)
-          else if (charUuid.contains('CE02')) {
-            _wifiConfigChar = char;
-            
-            // Enable notifications on CF02 as backup notification channel
-            if (char.properties.notify || char.properties.indicate) {
-              try {
-                await char.setNotifyValue(true);
-                
-                // Listen for notifications on CF02 (backup if CE02 fails)
-                if (_notificationSubscription == null) { // Don't override CE02 subscription
-                  _notificationSubscription = char.onValueReceived.listen(
-                    (value) {
-                      String message = String.fromCharCodes(value);
-                      if (kDebugMode) {
-                        print('Received notification from CF02: $message');
-                      }
-                      _notificationController.add(message);
-                    },
-                    onError: (error) {
-                      if (kDebugMode) {
-                        print('CF02 notification error: $error');
-                      }
-                    },
-                  );
-                }
-                
-                if (kDebugMode) {
-                  print('Found CF02 (write + backup notify) in service $serviceUuid and enabled notifications: $charUuid');
-                }
-              } catch (e) {
-                if (kDebugMode) {
-                  print('Could not enable notifications on CF02: $e');
-                }
-              }
-            }
-            
-            if (kDebugMode) {
-              print('Found CF02 (WiFi config - write capable) in service $serviceUuid: $charUuid');
-            }
-          }
-          // Fallback characteristics
-          else if (charUuid.contains('CF01') && _wifiListChar == null) {
-            _wifiListChar = char;
-            if (kDebugMode) {
-              print('Found CF01 (fallback WiFi list) in service $serviceUuid: $charUuid');
-            }
+            break;
           }
         }
-      }
-      
-      // Fallback: If only one characteristic found, use it for both read and write
-      if (_wifiListChar == null && _wifiConfigChar != null) {
-        if (kDebugMode) {
-          print('Using CF02 for both read and write operations');
-        }
-        _wifiListChar = _wifiConfigChar;
-      } else if (_wifiConfigChar == null && _wifiListChar != null) {
-        if (kDebugMode) {
-          print('Using CE01 for both read and write operations (fallback)');
-        }
-        _wifiConfigChar = _wifiListChar;
       }
       
       // Check if we found required characteristics
@@ -210,8 +152,8 @@ class ESP32Handler {
         _isConnected = true;
         if (kDebugMode) {
           print('Successfully connected to ESP32');
-          print('WiFi list char: ${_wifiListChar?.uuid ?? "Not found"}');
-          print('WiFi config char: ${_wifiConfigChar?.uuid ?? "Not found"}');
+          print('WiFi list char (CE01): ${_wifiListChar?.uuid ?? "Not found"}');
+          print('WiFi config char (CE02): ${_wifiConfigChar?.uuid ?? "Not found"}');
         }
       } else {
         if (kDebugMode) {
@@ -231,11 +173,9 @@ class ESP32Handler {
     }
   }
   
-  // Read WiFi list from CE01 (or CF02 if CE01 not available)
+  // Read WiFi list from CE01
   Future<List<String>> readWiFiList() async {
-    BluetoothCharacteristic? charToRead = _wifiListChar ?? _wifiConfigChar;
-    
-    if (charToRead == null) {
+    if (_wifiListChar == null) {
       if (kDebugMode) {
         print('No characteristic available for reading WiFi list');
       }
@@ -244,10 +184,10 @@ class ESP32Handler {
     
     try {
       if (kDebugMode) {
-        print('Reading WiFi list from ${charToRead.uuid}...');
+        print('Reading WiFi list from ${_wifiListChar!.uuid}...');
       }
       
-      List<int> value = await charToRead.read();
+      List<int> value = await _wifiListChar!.read();
       String data = String.fromCharCodes(value);
       
       if (kDebugMode) {
@@ -326,7 +266,7 @@ class ESP32Handler {
     }
   }
   
-  // Send WiFi credentials using CORRECT format: "_UWF:<ssid>0x06<password>0x04"
+  // Send WiFi credentials using format: "_UWF:<ssid>0x06<password>0x04"
   Future<bool> sendWiFiCredentials(String ssid, String password) async {
     if (_wifiConfigChar == null) {
       if (kDebugMode) {
@@ -340,34 +280,19 @@ class ESP32Handler {
         print('Sending WiFi credentials - SSID: $ssid, Password: ${password.replaceAll(RegExp(r'.'), '*')}');
       }
       
-      // CORRECT format: "_UWF:<ssid>0x06<password>0x04"
-      // Based on successful hex: 5F5557463A434849204B49454E06323931323230303504
+      // Format: "_UWF:<ssid>0x06<password>0x04"
       List<int> data = [];
-      data.addAll('_UWF:'.codeUnits);  // Command prefix: 5F555746 3A
-      data.addAll(ssid.codeUnits);     // WiFi SSID: 434849204B49454E (CHI KIEN)
-      data.add(0x06);                  // Separator byte: 06
-      data.addAll(password.codeUnits); // WiFi password: 323931323230303504 (29122005)
-      data.add(0x04);                  // End command byte: 04
+      data.addAll('_UWF:'.codeUnits);   // Command prefix
+      data.addAll(ssid.codeUnits);      // WiFi SSID
+      data.add(0x06);                   // Separator byte
+      data.addAll(password.codeUnits);  // WiFi password
+      data.add(0x04);                   // End command byte
       
       if (kDebugMode) {
         print('Sending WiFi config data to ${_wifiConfigChar!.uuid}:');
         print('Format: "_UWF:<ssid>0x06<password>0x04"');
-        print('Expected hex (reference): 5F5557463A434849204B49454E06323931323230303504');
-        print('Actual hex: ${data.map((b) => b.toRadixString(16).padLeft(2, '0')).join('')}');
-        print('Hex with spaces: ${data.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}');
-        print('String representation: ${String.fromCharCodes(data.where((b) => b >= 32 && b <= 126))}[special bytes: ${data.where((b) => b < 32 || b > 126).map((b) => '0x${b.toRadixString(16).padLeft(2, '0')}').join(', ')}]');
+        print('Hex: ${data.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}');
         print('Data length: ${data.length} bytes');
-        
-        // Verify hex matches the successful pattern
-        String actualHex = data.map((b) => b.toRadixString(16).padLeft(2, '0')).join('').toUpperCase();
-        String expectedHex = '5F5557463A434849204B49454E06323931323230303504';
-        if (actualHex == expectedHex) {
-          print('✅ Hex matches successful transmission pattern exactly!');
-        } else {
-          print('⚠️ Hex differs from successful pattern:');
-          print('Expected: $expectedHex');
-          print('Actual:   $actualHex');
-        }
       }
       
       await _wifiConfigChar!.write(data, withoutResponse: false);
@@ -387,10 +312,7 @@ class ESP32Handler {
     }
   }
   
-  // Remove the alternative methods since we have the correct format
-  // Send END command using correct format: "_END.*0x04"
-  
-  // Send END command using correct format: "_END.*0x04"
+  // Send END command using format: "_END.*0x04"
   Future<bool> sendEndCommand() async {
     if (_wifiConfigChar == null) {
       if (kDebugMode) {
@@ -404,7 +326,7 @@ class ESP32Handler {
         print('Sending END command to complete WiFi setup process...');
       }
       
-      // Correct format: "_END.*" with 0x04 end byte
+      // Format: "_END.*" with 0x04 end byte
       List<int> data = '_END.*'.codeUnits;
       data.add(0x04); // End command byte
       
@@ -412,7 +334,6 @@ class ESP32Handler {
         print('Sending END command data to ${_wifiConfigChar!.uuid}:');
         print('Format: "_END.*0x04"');
         print('Hex: ${data.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}');
-        print('String representation: ${String.fromCharCodes(data.where((b) => b >= 32 && b <= 126))}[special bytes: ${data.where((b) => b < 32 || b > 126).map((b) => '0x${b.toRadixString(16).padLeft(2, '0')}').join(', ')}]');
         print('Data length: ${data.length} bytes');
       }
       

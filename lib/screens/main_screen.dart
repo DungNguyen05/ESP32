@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'dart:async';
 import '../models/device_model.dart';
 import '../services/ble_service.dart';
+import '../services/api_service.dart';
 import 'wifi_setup_screen.dart';
 
 class MainScreen extends StatefulWidget {
@@ -14,10 +15,12 @@ class _MainScreenState extends State<MainScreen> {
   bool _isScanning = false;
   StreamSubscription? _devicesSubscription;
   String _statusMessage = 'Nhấn nút quét để tìm thiết bị ESP32';
+  bool _serverConnected = false;
   
   @override
   void initState() {
     super.initState();
+    _checkServerConnection();
     _setupDevicesListener();
   }
   
@@ -29,6 +32,23 @@ class _MainScreenState extends State<MainScreen> {
     super.dispose();
   }
   
+  Future<void> _checkServerConnection() async {
+    bool connected = await ApiService.checkServerConnection();
+    setState(() {
+      _serverConnected = connected;
+    });
+    
+    if (!connected) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Không thể kết nối đến server. Một số tính năng có thể bị hạn chế.'),
+          backgroundColor: Colors.orange,
+          duration: Duration(seconds: 5),
+        ),
+      );
+    }
+  }
+  
   void _setupDevicesListener() {
     _devicesSubscription = BLEService.devicesStream.listen(
       (devices) {
@@ -36,11 +56,11 @@ class _MainScreenState extends State<MainScreen> {
           setState(() {
             _discoveredDevices = devices;
             if (devices.isNotEmpty) {
-              _statusMessage = 'Tìm thấy ${devices.length} thiết bị ESP32';
+              _statusMessage = 'Tìm thấy ${devices.length} thiết bị ESP32 đã đăng ký';
             } else if (_isScanning) {
               _statusMessage = 'Đang tìm kiếm thiết bị...';
             } else {
-              _statusMessage = 'Không tìm thấy thiết bị nào';
+              _statusMessage = 'Không tìm thấy thiết bị ESP32 nào đã đăng ký';
             }
           });
         }
@@ -63,7 +83,7 @@ class _MainScreenState extends State<MainScreen> {
     );
   }
   
-  void _startScanning() async {
+  Future<void> _startScanning() async {
     if (_isScanning) return;
     
     setState(() {
@@ -86,6 +106,14 @@ class _MainScreenState extends State<MainScreen> {
         }
       }
       
+      // Check server connection before scanning
+      if (!_serverConnected) {
+        await _checkServerConnection();
+        if (!_serverConnected) {
+          throw Exception('Không thể kết nối đến server để xác thực thiết bị.');
+        }
+      }
+      
       setState(() {
         _statusMessage = 'Đang tìm kiếm thiết bị ESP32...';
       });
@@ -93,9 +121,9 @@ class _MainScreenState extends State<MainScreen> {
       await BLEService.startScan(timeoutSeconds: 30);
       
       // Auto stop scanning after timeout
-      Timer(Duration(seconds: 30), () {
+      Timer(Duration(seconds: 30), () async {
         if (_isScanning && mounted) {
-          _stopScanning();
+          await _stopScanning();
         }
       });
       
@@ -117,8 +145,7 @@ class _MainScreenState extends State<MainScreen> {
     }
   }
   
-  // FIXED - Remove await from void function
-  void _stopScanning() async {
+  Future<void> _stopScanning() async {
     if (!_isScanning) return;
     
     await BLEService.stopScan();
@@ -127,16 +154,28 @@ class _MainScreenState extends State<MainScreen> {
       setState(() {
         _isScanning = false;
         _statusMessage = _discoveredDevices.isEmpty 
-            ? 'Không tìm thấy thiết bị nào' 
-            : 'Tìm thấy ${_discoveredDevices.length} thiết bị ESP32';
+            ? 'Không tìm thấy thiết bị ESP32 nào đã đăng ký' 
+            : 'Tìm thấy ${_discoveredDevices.length} thiết bị ESP32 đã đăng ký';
       });
     }
   }
   
-  void _connectToDevice(ESP32Device device) async {
+  Future<void> _connectToDevice(ESP32Device device) async {
     // Stop scanning before connecting
     if (_isScanning) {
-      _stopScanning();
+      await _stopScanning();
+    }
+    
+    // Double check device registration before proceeding
+    bool isValid = await device.validateRegistration();
+    if (!isValid) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Thiết bị không hợp lệ hoặc không thuộc về tài khoản này.'),
+          backgroundColor: Colors.red,
+        ),
+      );
+      return;
     }
     
     Navigator.push(
@@ -144,12 +183,23 @@ class _MainScreenState extends State<MainScreen> {
       MaterialPageRoute(
         builder: (context) => WiFiSetupScreen(device: device),
       ),
-    ).then((_) {
+    ).then((result) {
       // Refresh the list when returning from setup screen
       if (mounted) {
         setState(() {
           _discoveredDevices = BLEService.getDiscoveredDevices();
         });
+        
+        // If setup was successful, show additional message
+        if (result == true) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Thiết bị đã được thêm thành công vào hệ thống!'),
+              backgroundColor: Colors.green,
+              duration: Duration(seconds: 3),
+            ),
+          );
+        }
       }
     });
   }
@@ -171,6 +221,7 @@ class _MainScreenState extends State<MainScreen> {
                 ),
                 Text('• Đảm bảo thiết bị đã được cấp nguồn'),
                 Text('• Nhấn giữ nút bất kỳ trong 5 giây để vào chế độ cấu hình WiFi'),
+                Text('• Thiết bị sẽ timeout sau 3 phút nếu không cấu hình'),
                 SizedBox(height: 16),
                 Text(
                   '2. Quét thiết bị:',
@@ -178,6 +229,7 @@ class _MainScreenState extends State<MainScreen> {
                 ),
                 Text('• Nhấn nút "Quét thiết bị" để tìm ESP32'),
                 Text('• Thiết bị sẽ hiển thị với tên "GC-<SN>"'),
+                Text('• Chỉ thiết bị đã đăng ký mới được hiển thị'),
                 SizedBox(height: 16),
                 Text(
                   '3. Cấu hình WiFi:',
@@ -188,11 +240,21 @@ class _MainScreenState extends State<MainScreen> {
                 Text('• Chờ thiết bị kết nối (tối đa 40 giây)'),
                 SizedBox(height: 16),
                 Text(
-                  'Lưu ý:',
-                  style: TextStyle(fontWeight: FontWeight.bold, color: Colors.orange),
+                  '4. Hoàn tất cấu hình:',
+                  style: TextStyle(fontWeight: FontWeight.bold),
                 ),
-                Text('• Thiết bị sẽ timeout sau 3 phút nếu không cấu hình'),
+                Text('• Sau khi thiết bị kết nối WiFi thành công'),
+                Text('• Nhấn "Xác nhận hoàn thành" để thêm vào hệ thống'),
+                Text('• Thiết bị sẽ chính thức được ghi nhận'),
+                SizedBox(height: 16),
+                Text(
+                  'Lưu ý quan trọng:',
+                  style: TextStyle(fontWeight: FontWeight.bold, color: Colors.red),
+                ),
                 Text('• Đảm bảo Bluetooth và Location được bật'),
+                Text('• Cần kết nối internet để xác thực thiết bị'),
+                Text('• Chỉ thiết bị thuộc tài khoản của bạn mới hiển thị'),
+                Text('• Phải nhấn "Xác nhận hoàn thành" để hoàn tất'),
               ],
             ),
           ),
@@ -219,6 +281,17 @@ class _MainScreenState extends State<MainScreen> {
             icon: Icon(Icons.help_outline),
             onPressed: _showInstructions,
             tooltip: 'Hướng dẫn',
+          ),
+          // Server status indicator
+          Container(
+            margin: EdgeInsets.only(right: 16),
+            child: Center(
+              child: Icon(
+                _serverConnected ? Icons.cloud_done : Icons.cloud_off,
+                color: _serverConnected ? Colors.white : Colors.red.shade300,
+                size: 20,
+              ),
+            ),
           ),
         ],
       ),
@@ -258,6 +331,13 @@ class _MainScreenState extends State<MainScreen> {
                     ),
                   ),
                 ),
+                if (!_serverConnected) ...[
+                  Icon(
+                    Icons.warning,
+                    color: Colors.orange,
+                    size: 16,
+                  ),
+                ],
               ],
             ),
           ),
@@ -277,7 +357,7 @@ class _MainScreenState extends State<MainScreen> {
         children: [
           if (_isScanning)
             FloatingActionButton(
-              onPressed: _stopScanning,
+              onPressed: () async => await _stopScanning(),
               backgroundColor: Colors.red,
               heroTag: "stop",
               child: Icon(Icons.stop),
@@ -285,7 +365,7 @@ class _MainScreenState extends State<MainScreen> {
             )
           else
             FloatingActionButton(
-              onPressed: _startScanning,
+              onPressed: () async => await _startScanning(),
               backgroundColor: Colors.teal,
               heroTag: "scan",
               child: Icon(Icons.bluetooth_searching),
@@ -323,7 +403,7 @@ class _MainScreenState extends State<MainScreen> {
             SizedBox(height: 16),
             if (!_isScanning) ...[
               Text(
-                'Hãy đảm bảo ESP32 đang ở chế độ cấu hình WiFi\nvà nhấn nút quét để tìm thiết bị',
+                'Hãy đảm bảo ESP32 đang ở chế độ cấu hình WiFi\nvà thiết bị đã được đăng ký trong hệ thống',
                 style: TextStyle(
                   fontSize: 14,
                   color: Colors.grey.shade500,
@@ -332,7 +412,7 @@ class _MainScreenState extends State<MainScreen> {
               ),
               SizedBox(height: 24),
               ElevatedButton.icon(
-                onPressed: _startScanning,
+                onPressed: () async => await _startScanning(),
                 icon: Icon(Icons.refresh),
                 label: Text('Quét lại'),
                 style: ElevatedButton.styleFrom(
@@ -430,7 +510,7 @@ class _MainScreenState extends State<MainScreen> {
                       borderRadius: BorderRadius.circular(12),
                     ),
                     child: Text(
-                      'Đã đăng ký',
+                      'Đã xác thực',
                       style: TextStyle(
                         fontSize: 10,
                         color: Colors.green.shade700,
@@ -442,7 +522,7 @@ class _MainScreenState extends State<MainScreen> {
                 Icon(Icons.arrow_forward_ios, size: 16),
               ],
             ),
-            onTap: () => _connectToDevice(device),
+            onTap: () async => await _connectToDevice(device),
           ),
         );
       },

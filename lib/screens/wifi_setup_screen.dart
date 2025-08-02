@@ -3,6 +3,7 @@ import 'dart:async';
 import '../models/device_model.dart';
 import '../services/esp32_handler.dart';
 import '../services/notification_service.dart';
+import '../services/api_service.dart';
 
 enum SetupState {
   connecting,
@@ -34,6 +35,7 @@ class _WiFiSetupScreenState extends State<WiFiSetupScreen> {
   StreamSubscription? _notificationSubscription;
   Timer? _timeoutTimer;
   bool _obscurePassword = true;
+  bool _isCompletingSetup = false;
   
   @override
   void initState() {
@@ -150,25 +152,73 @@ class _WiFiSetupScreenState extends State<WiFiSetupScreen> {
     
     setState(() {
       _currentState = SetupState.success;
-      _statusMessage = 'Thiết bị đã kết nối WiFi thành công! 🎉';
+      _statusMessage = 'Thiết bị đã kết nối WiFi thành công! 🎉\nVui lòng nhấn "Xác nhận hoàn thành" để thêm thiết bị vào hệ thống.';
     });
     
     // Show notification
     await NotificationService.showWiFiSuccessNotification();
     
-    // Send END command
-    await _esp32Handler.sendEndCommand();
+    // NOTE: Không gửi END command ở đây, chờ user xác nhận
   }
   
-  void _completeSetup() {
-    Navigator.pop(context, true);
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text('Thiết bị ${widget.device.name} đã được thêm thành công!'),
-        backgroundColor: Colors.green,
-        duration: Duration(seconds: 3),
-      ),
-    );
+  void _completeSetup() async {
+    if (_isCompletingSetup) return; // Prevent double tap
+    
+    setState(() {
+      _isCompletingSetup = true;
+      _statusMessage = 'Đang hoàn tất cấu hình...';
+    });
+    
+    try {
+      // 1. Gửi END command trước
+      bool endSent = await _esp32Handler.sendEndCommand();
+      
+      if (!endSent) {
+        throw Exception('Không thể gửi lệnh kết thúc đến thiết bị');
+      }
+      
+      // 2. Thêm device vào hệ thống qua API
+      bool deviceAdded = await ApiService.addDeviceToSystem(
+        serialNumber: widget.device.serialNumber,
+        deviceId: widget.device.deviceId,
+        name: widget.device.name,
+      );
+      
+      if (!deviceAdded) {
+        throw Exception('Không thể thêm thiết bị vào hệ thống');
+      }
+      
+      // 3. Disconnect từ thiết bị
+      await _esp32Handler.disconnect();
+      
+      // 4. Thành công - quay về màn hình chính
+      if (mounted) {
+        Navigator.pop(context, true);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Thêm thiết bị ${widget.device.name} thành công!'),
+            backgroundColor: Colors.green,
+            duration: Duration(seconds: 3),
+          ),
+        );
+      }
+      
+    } catch (e) {
+      setState(() {
+        _isCompletingSetup = false;
+        _statusMessage = 'Thiết bị đã kết nối WiFi thành công! 🎉\nVui lòng nhấn "Xác nhận hoàn thành" để thêm thiết bị vào hệ thống.';
+      });
+      
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Lỗi hoàn tất cấu hình: ${e.toString()}'),
+            backgroundColor: Colors.red,
+            duration: Duration(seconds: 5),
+          ),
+        );
+      }
+    }
   }
   
   void _retryConnection() {
@@ -477,8 +527,36 @@ class _WiFiSetupScreenState extends State<WiFiSetupScreen> {
               ),
             ),
             SizedBox(height: 32),
+            
+            // Warning box
+            Container(
+              padding: EdgeInsets.all(16),
+              margin: EdgeInsets.only(bottom: 24),
+              decoration: BoxDecoration(
+                color: Colors.orange.shade50,
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: Colors.orange.shade200),
+              ),
+              child: Row(
+                children: [
+                  Icon(Icons.warning_outlined, color: Colors.orange),
+                  SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      'Chỉ khi bạn nhấn "Xác nhận hoàn thành", thiết bị mới được thêm chính thức vào hệ thống.',
+                      style: TextStyle(
+                        fontSize: 14,
+                        color: Colors.orange.shade800,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            
             ElevatedButton(
-              onPressed: _completeSetup,
+              onPressed: _isCompletingSetup ? null : _completeSetup,
               style: ElevatedButton.styleFrom(
                 backgroundColor: Colors.green,
                 foregroundColor: Colors.white,
@@ -487,20 +565,42 @@ class _WiFiSetupScreenState extends State<WiFiSetupScreen> {
                   borderRadius: BorderRadius.circular(12),
                 ),
               ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(Icons.done),
-                  SizedBox(width: 8),
-                  Text(
-                    'Hoàn thành',
-                    style: TextStyle(
-                      fontSize: 16,
-                      fontWeight: FontWeight.bold,
+              child: _isCompletingSetup
+                  ? Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        SizedBox(
+                          width: 20,
+                          height: 20,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                          ),
+                        ),
+                        SizedBox(width: 12),
+                        Text(
+                          'Đang xử lý...',
+                          style: TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ],
+                    )
+                  : Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(Icons.check_circle),
+                        SizedBox(width: 8),
+                        Text(
+                          'Xác nhận hoàn thành',
+                          style: TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ],
                     ),
-                  ),
-                ],
-              ),
             ),
           ],
         ),

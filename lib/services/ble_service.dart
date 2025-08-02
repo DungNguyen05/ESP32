@@ -9,6 +9,7 @@ class BLEService {
       StreamController<List<ESP32Device>>.broadcast();
   
   static List<ESP32Device> _discoveredDevices = [];
+  static bool _isScanning = false;
   
   // Stream of discovered ESP32 devices
   static Stream<List<ESP32Device>> get devicesStream => _devicesController.stream;
@@ -31,7 +32,7 @@ class BLEService {
         return false;
       }
       
-      // Check if Bluetooth is on - FIXED
+      // Check if Bluetooth is on
       BluetoothAdapterState state = await FlutterBluePlus.adapterState.first;
       return state == BluetoothAdapterState.on;
     } catch (e) {
@@ -71,6 +72,7 @@ class BLEService {
       // Clear previous devices
       _discoveredDevices.clear();
       _devicesController.add([]);
+      _isScanning = true;
       
       // Stop any existing scan
       await stopScan();
@@ -98,18 +100,22 @@ class BLEService {
             print('Scan error: $error');
           }
           _devicesController.addError(error);
+          _isScanning = false;
         },
       );
       
       // Auto-stop scan after timeout
       Timer(Duration(seconds: timeoutSeconds), () {
-        stopScan();
+        if (_isScanning) {
+          stopScan();
+        }
       });
       
     } catch (e) {
       if (kDebugMode) {
         print('Error starting scan: $e');
       }
+      _isScanning = false;
       _devicesController.addError(e);
     }
   }
@@ -141,9 +147,9 @@ class BLEService {
     _devicesController.add(_discoveredDevices);
   }
   
-  // Process scan results and filter ESP32 devices
-  static void _processScanResults(List<ScanResult> results) {
-    List<ESP32Device> currentDevices = [];
+  // Process scan results and filter ESP32 devices với validation async
+  static void _processScanResults(List<ScanResult> results) async {
+    List<ESP32Device> validDevices = [];
     
     for (ScanResult result in results) {
       String deviceName = result.device.platformName;
@@ -163,13 +169,27 @@ class BLEService {
             rssi: result.rssi.toString(),
           );
           
-          // Only add registered devices and avoid duplicates
-          if (esp32Device.isRegistered && 
-              !currentDevices.any((d) => d.deviceId == esp32Device.deviceId)) {
-            currentDevices.add(esp32Device);
+          // Validate device registration with backend
+          bool isValidDevice = await esp32Device.validateRegistration();
+          
+          if (isValidDevice && !validDevices.any((d) => d.deviceId == esp32Device.deviceId)) {
+            // Create new device object with correct registration status
+            ESP32Device validatedDevice = ESP32Device(
+              name: esp32Device.name,
+              serialNumber: esp32Device.serialNumber,
+              deviceId: esp32Device.deviceId,
+              isRegistered: true,
+              rssi: esp32Device.rssi,
+            );
+            
+            validDevices.add(validatedDevice);
             
             if (kDebugMode) {
-              print('Found ESP32 device: ${esp32Device.name} (${esp32Device.serialNumber})');
+              print('Found and validated ESP32 device: ${validatedDevice.name} (${validatedDevice.serialNumber})');
+            }
+          } else if (!isValidDevice) {
+            if (kDebugMode) {
+              print('Device ${esp32Device.name} is not registered or does not belong to current user');
             }
           }
         }
@@ -177,8 +197,8 @@ class BLEService {
     }
     
     // Update discovered devices if changed
-    if (!_listEquals(_discoveredDevices, currentDevices)) {
-      _discoveredDevices = List.from(currentDevices);
+    if (!_listEquals(_discoveredDevices, validDevices)) {
+      _discoveredDevices = List.from(validDevices);
       _devicesController.add(_discoveredDevices);
     }
   }
@@ -197,12 +217,13 @@ class BLEService {
   // Stop BLE scan
   static Future<void> stopScan() async {
     try {
+      _isScanning = false;
       await _scanSubscription?.cancel();
       _scanSubscription = null;
       
       if (kIsWeb) return; // No actual scanning on web
       
-      // FIXED - Check if scanning properly
+      // Check if scanning properly
       bool isCurrentlyScanning = await FlutterBluePlus.isScanning.first;
       if (isCurrentlyScanning) {
         await FlutterBluePlus.stopScan();
@@ -223,10 +244,10 @@ class BLEService {
     return List.from(_discoveredDevices);
   }
   
-  // Check if currently scanning - FIXED
+  // Check if currently scanning
   static Future<bool> isScanning() async {
     try {
-      if (kIsWeb) return false;
+      if (kIsWeb) return _isScanning;
       return await FlutterBluePlus.isScanning.first;
     } catch (e) {
       return false;
@@ -237,5 +258,6 @@ class BLEService {
   static void dispose() {
     _scanSubscription?.cancel();
     _devicesController.close();
+    _isScanning = false;
   }
 }
