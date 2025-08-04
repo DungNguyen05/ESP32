@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'dart:async';
 import '../models/device_model.dart';
 import '../services/esp32_handler.dart';
@@ -62,8 +63,29 @@ class _WiFiSetupScreenState extends State<WiFiSetupScreen> {
     bool connected = await _esp32Handler.connectToDevice(widget.device.deviceId);
     
     if (connected) {
-      _readWiFiList();
+      print('✓ Connected to device, setting up notifications...');
+      
+      // Step 1: Start listening for notifications immediately
       _listenForNotifications();
+      
+      // Step 2: Force enable notifications on all characteristics
+      setState(() {
+        _statusMessage = 'Đang thiết lập notifications...';
+      });
+      
+      await _esp32Handler.debugNotifications();
+      
+      // Step 3: Small delay to ensure notifications are ready
+      await Future.delayed(Duration(milliseconds: 1000));
+      
+      // Step 4: Read WiFi list
+      setState(() {
+        _statusMessage = 'Notifications đã sẵn sàng, đang đọc WiFi list...';
+      });
+      
+      _readWiFiList();
+      
+      print('✓ Setup complete - ready to receive notifications');
     } else {
       setState(() {
         _currentState = SetupState.error;
@@ -91,16 +113,49 @@ class _WiFiSetupScreenState extends State<WiFiSetupScreen> {
   }
   
   void _listenForNotifications() {
+    print('=== Starting to listen for notifications ===');
+    
     _notificationSubscription = _esp32Handler.notificationStream.listen(
       (message) {
-        print('Received notification: $message');
+        print('🔔 RAW NOTIFICATION: "$message"');
+        print('   Length: ${message.length} characters');
+        print('   Bytes: ${message.codeUnits.map((b) => '0x${b.toRadixString(16).padLeft(2, '0')}').join(' ')}');
+        print('   Checking for WiFi_OK patterns...');
         
-        if (message.toLowerCase().contains('wifi_ok')) {
+        // Check for various WiFi_OK patterns (case insensitive)
+        String lowerMessage = message.toLowerCase().trim();
+        String trimmedMessage = message.trim();
+        
+        bool isWifiOk = lowerMessage.contains('wifi_ok') || 
+                       lowerMessage.contains('wifi ok') ||
+                       lowerMessage.contains('wifiok') ||
+                       lowerMessage == 'wifi_ok' ||
+                       lowerMessage == 'ok' ||
+                       trimmedMessage == 'Wifi_OK' ||
+                       trimmedMessage == 'wifi_ok' ||
+                       trimmedMessage == 'OK';
+        
+        if (isWifiOk) {
+          print('✅ WiFi connection successful! Pattern matched: "$message"');
+          print('   Canceling timeout timer...');
+          _timeoutTimer?.cancel();
           _onWiFiConnected();
+        } else {
+          print('ℹ  Other notification (not WiFi_OK): "$message"');
+          
+          // Check if it contains any success indicators
+          if (lowerMessage.contains('connect') && lowerMessage.contains('ok') ||
+              lowerMessage.contains('success') ||
+              lowerMessage.contains('done') ||
+              lowerMessage.contains('wifi') && lowerMessage.contains('ok')) {
+            print('🤔 Possible success notification, treating as WiFi_OK');
+            _timeoutTimer?.cancel();
+            _onWiFiConnected();
+          }
         }
       },
       onError: (error) {
-        print('Notification error: $error');
+        print('✗ Notification stream error: $error');
         if (mounted) {
           setState(() {
             _currentState = SetupState.error;
@@ -109,16 +164,42 @@ class _WiFiSetupScreenState extends State<WiFiSetupScreen> {
         }
       },
     );
+    
+    // Check if notifications are ready
+    Future.delayed(Duration(milliseconds: 100), () async {
+      bool ready = await _esp32Handler.areNotificationsReady();
+      int count = _esp32Handler.activeNotificationCount;
+      print('✓ Notification listener started');
+      print('   Active subscriptions: $count');
+      print('   Ready to receive: $ready');
+      print('   Waiting for ESP32 to send "Wifi_OK"...');
+    });
   }
   
   void _sendWiFiCredentials() async {
     if (!_formKey.currentState!.validate()) return;
     
+    print('=== User clicked Send WiFi Credentials ===');
+    print('SSID: "${_ssidController.text}"');
+    print('Password: "${_passwordController.text.replaceAll(RegExp(r'.'), '*')}"');
+    
     setState(() {
       _currentState = SetupState.waitingForConnection;
+      _statusMessage = 'Đang chuẩn bị gửi thông tin WiFi...';
+    });
+    
+    // IMPORTANT: Make sure notifications are listening BEFORE sending credentials
+    print('Step 1: Ensuring notifications are properly set up...');
+    await _esp32Handler.debugNotifications(); // Force enable all notifications
+    
+    // Small delay to ensure notifications are ready
+    await Future.delayed(Duration(milliseconds: 500));
+    
+    setState(() {
       _statusMessage = 'Đang gửi thông tin WiFi cho thiết bị...';
     });
     
+    print('Step 2: Sending WiFi credentials...');
     bool sent = await _esp32Handler.sendWiFiCredentials(
       _ssidController.text,
       _passwordController.text,
@@ -126,17 +207,19 @@ class _WiFiSetupScreenState extends State<WiFiSetupScreen> {
     
     if (sent) {
       setState(() {
-        _statusMessage = 'Thiết bị đang kết nối WiFi...\n(Có thể mất tới 40 giây)';
+        _statusMessage = 'Thiết bị đang kết nối WiFi...\n(Đang chờ thông báo "Wifi_OK", tối đa 40 giây)';
       });
+      
+      print('✓ WiFi credentials sent, starting 40s timeout timer...');
+      print('Now waiting for "Wifi_OK" notification...');
       
       // Start timeout timer (40 seconds as per spec)
       _timeoutTimer = Timer(Duration(seconds: 40), () {
         if (_currentState == SetupState.waitingForConnection && mounted) {
-          setState(() {
-            _currentState = SetupState.error;
-            _statusMessage = 'Timeout: Thiết bị không thể kết nối WiFi sau 40 giây.\nVui lòng kiểm tra lại thông tin WiFi.';
-          });
-          NotificationService.showTimeoutNotification();
+          print('⏰ TIMEOUT: No Wifi_OK received after 40 seconds');
+          
+          // Show option to proceed manually
+          _showManualProceedDialog();
         }
       });
     } else {
@@ -147,7 +230,59 @@ class _WiFiSetupScreenState extends State<WiFiSetupScreen> {
     }
   }
   
+  // Show dialog to proceed manually if no notification received
+  void _showManualProceedDialog() {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: Text('Timeout - Không nhận được thông báo'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('Không nhận được thông báo "Wifi_OK" sau 40 giây.'),
+              SizedBox(height: 16),
+              Text('Có thể thiết bị đã kết nối WiFi thành công nhưng không gửi được thông báo qua BLE.'),
+              SizedBox(height: 16),
+              Text(
+                'Bạn có muốn tiếp tục hoàn tất cấu hình không?',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.of(context).pop();
+                setState(() {
+                  _currentState = SetupState.error;
+                  _statusMessage = 'Timeout: Thiết bị không thể kết nối WiFi sau 40 giây.\nVui lòng kiểm tra lại thông tin WiFi.';
+                });
+              },
+              child: Text('Hủy'),
+            ),
+            ElevatedButton(
+              onPressed: () {
+                Navigator.of(context).pop();
+                print('📱 User chose to proceed manually after timeout');
+                _onWiFiConnected(); // Proceed as if WiFi connected successfully
+              },
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.green,
+                foregroundColor: Colors.white,
+              ),
+              child: Text('Tiếp tục'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+  
   void _onWiFiConnected() async {
+    print('=== WiFi Connected Successfully! ===');
     _timeoutTimer?.cancel();
     
     setState(() {
@@ -158,11 +293,13 @@ class _WiFiSetupScreenState extends State<WiFiSetupScreen> {
     // Show notification
     await NotificationService.showWiFiSuccessNotification();
     
-    // NOTE: Không gửi END command ở đây, chờ user xác nhận
+    print('✓ Moved to success state, waiting for user confirmation...');
   }
   
   void _completeSetup() async {
     if (_isCompletingSetup) return; // Prevent double tap
+    
+    print('=== User clicked Complete Setup ===');
     
     setState(() {
       _isCompletingSetup = true;
@@ -170,14 +307,17 @@ class _WiFiSetupScreenState extends State<WiFiSetupScreen> {
     });
     
     try {
-      // 1. Gửi END command trước
+      // 1. Send END command first
+      print('Step 1: Sending END command...');
       bool endSent = await _esp32Handler.sendEndCommand();
       
       if (!endSent) {
         throw Exception('Không thể gửi lệnh kết thúc đến thiết bị');
       }
+      print('✓ END command sent successfully');
       
-      // 2. Thêm device vào hệ thống qua API
+      // 2. Add device to system via API
+      print('Step 2: Adding device to system...');
       bool deviceAdded = await ApiService.addDeviceToSystem(
         serialNumber: widget.device.serialNumber,
         deviceId: widget.device.deviceId,
@@ -187,11 +327,15 @@ class _WiFiSetupScreenState extends State<WiFiSetupScreen> {
       if (!deviceAdded) {
         throw Exception('Không thể thêm thiết bị vào hệ thống');
       }
+      print('✓ Device added to system successfully');
       
-      // 3. Disconnect từ thiết bị
+      // 3. Disconnect from device
+      print('Step 3: Disconnecting from device...');
       await _esp32Handler.disconnect();
+      print('✓ Disconnected successfully');
       
-      // 4. Thành công - quay về màn hình chính
+      // 4. Success - return to main screen
+      print('✓ Setup completed successfully!');
       if (mounted) {
         Navigator.pop(context, true);
         ScaffoldMessenger.of(context).showSnackBar(
@@ -204,6 +348,7 @@ class _WiFiSetupScreenState extends State<WiFiSetupScreen> {
       }
       
     } catch (e) {
+      print('✗ Error completing setup: $e');
       setState(() {
         _isCompletingSetup = false;
         _statusMessage = 'Thiết bị đã kết nối WiFi thành công! 🎉\nVui lòng nhấn "Xác nhận hoàn thành" để thêm thiết bị vào hệ thống.';
@@ -230,6 +375,12 @@ class _WiFiSetupScreenState extends State<WiFiSetupScreen> {
     setState(() {
       _ssidController.text = network;
     });
+  }
+
+  // Add a debug button for testing notifications
+  void _testNotification() {
+    print('=== TEST: Simulating Wifi_OK notification ===');
+    _onWiFiConnected();
   }
   
   Widget _buildStateContent() {
@@ -282,12 +433,24 @@ class _WiFiSetupScreenState extends State<WiFiSetupScreen> {
               ),
               SizedBox(height: 8),
               Text(
-                'Vui lòng chờ...',
+                'Đang chờ thông báo "Wifi_OK"...',
                 style: TextStyle(
                   fontSize: 12,
                   color: Colors.grey.shade500,
                 ),
               ),
+              // Add debug button in debug mode
+              if (kDebugMode) ...[
+                SizedBox(height: 16),
+                ElevatedButton(
+                  onPressed: _testNotification,
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.orange,
+                    foregroundColor: Colors.white,
+                  ),
+                  child: Text('DEBUG: Simulate Wifi_OK'),
+                ),
+              ],
             ],
           ],
         ),
@@ -378,10 +541,6 @@ class _WiFiSetupScreenState extends State<WiFiSetupScreen> {
                 border: OutlineInputBorder(
                   borderRadius: BorderRadius.circular(12),
                 ),
-                focusedBorder: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(12),
-                  borderSide: BorderSide(color: Colors.teal, width: 2),
-                ),
               ),
               validator: (value) {
                 if (value == null || value.isEmpty) {
@@ -410,18 +569,11 @@ class _WiFiSetupScreenState extends State<WiFiSetupScreen> {
                 border: OutlineInputBorder(
                   borderRadius: BorderRadius.circular(12),
                 ),
-                focusedBorder: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(12),
-                  borderSide: BorderSide(color: Colors.teal, width: 2),
-                ),
               ),
               obscureText: _obscurePassword,
               validator: (value) {
                 if (value == null || value.isEmpty) {
                   return 'Vui lòng nhập mật khẩu WiFi';
-                }
-                if (value.length < 8) {
-                  return 'Mật khẩu phải có ít nhất 8 ký tự';
                 }
                 return null;
               },
@@ -438,7 +590,6 @@ class _WiFiSetupScreenState extends State<WiFiSetupScreen> {
                 shape: RoundedRectangleBorder(
                   borderRadius: BorderRadius.circular(12),
                 ),
-                elevation: 2,
               ),
               child: Row(
                 mainAxisAlignment: MainAxisAlignment.center,
@@ -446,7 +597,7 @@ class _WiFiSetupScreenState extends State<WiFiSetupScreen> {
                   Icon(Icons.send),
                   SizedBox(width: 8),
                   Text(
-                    'Cấu hình WiFi',
+                    'Gửi thông tin WiFi',
                     style: TextStyle(
                       fontSize: 16,
                       fontWeight: FontWeight.bold,
@@ -472,7 +623,7 @@ class _WiFiSetupScreenState extends State<WiFiSetupScreen> {
                   SizedBox(width: 12),
                   Expanded(
                     child: Text(
-                      'Thiết bị sẽ thử kết nối WiFi trong 40 giây. Bạn sẽ nhận được thông báo khi hoàn tất.',
+                      'Thiết bị sẽ thử kết nối WiFi trong 40 giây. Bạn sẽ nhận được thông báo "Wifi_OK" khi hoàn tất.',
                       style: TextStyle(
                         fontSize: 14,
                         color: Colors.blue.shade700,
